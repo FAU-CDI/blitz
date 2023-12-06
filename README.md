@@ -6,7 +6,7 @@ By default, this acts as a transparent REST proxy that throttles requests to a c
 When a certain rate limit is exceeded, the proxy connection will be kept active until it can be forwarded. 
 The rate limit can be configured via command line arguments.
 
-Clients can request the current status by making a `GET`` request to `/blitz/`.
+Clients can request the current status by making a `GET` request to `/blitz/`.
 They get back a JSON object describing the current status:
 
 ```json
