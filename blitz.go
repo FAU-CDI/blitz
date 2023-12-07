@@ -1,9 +1,6 @@
 package blitz
 
 import (
-	"context"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,20 +8,31 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/nacl/sign"
 	"golang.org/x/time/rate"
 )
 
-// Blitz creates a new blitz server wrapping handler
-func New(rand io.Reader, handler http.Handler, every time.Duration, b int) (*Blitz, error) {
-	blitz := &Blitz{
-		every: every,
+var errAtLeastOneQueue = errors.New("at least one queue rate must be provided")
 
-		limiter: rate.NewLimiter(rate.Every(time.Second), b),
-		stats:   NewStats(10 * every),
+// Blitz creates a new blitz server wrapping handler
+func New(rand io.Reader, handler http.Handler, every time.Duration, bs []uint64) (*Blitz, error) {
+	if len(bs) == 0 {
+		return nil, errAtLeastOneQueue
+	}
+
+	blitz := &Blitz{
+		every:   every,
 		Handler: handler,
+	}
+
+	blitz.limiters = make([]*rate.Limiter, len(bs))
+	blitz.stats = make([]*Stats, len(bs))
+	for i, b := range bs {
+		blitz.limiters[i] = rate.NewLimiter(rate.Every(time.Second), int(b))
+		blitz.stats[i] = NewStats(10 * every)
 	}
 
 	puk, pik, err := sign.GenerateKey(rand)
@@ -41,204 +49,163 @@ func New(rand io.Reader, handler http.Handler, every time.Duration, b int) (*Bli
 type Blitz struct {
 	every time.Duration // how often the rate refills
 
-	limiter *rate.Limiter
+	// limiters and statistics for each queue
+	limiters []*rate.Limiter
+	stats    []*Stats
 
 	pubKey  *[32]byte
 	privKey *[64]byte
 
-	stats   *Stats
-	logger  *log.Logger
+	Logger  *log.Logger
 	Handler http.Handler
 }
 
 type Status struct {
-	// Number of tokens available right now.
-	// A negative value indicates having to wait.
-	AvailableSlots int64
-
-	// AverageDelay is the average delay over the past 10 seconds
-	AverageDelayInMilliseconds int64
+	Slots  []int64
+	Delays []int64
 }
 
-func (wrap *Blitz) Status() (st Status) {
-	st.AvailableSlots = int64(math.Floor(wrap.limiter.Tokens()))
-	i, _ := wrap.stats.Average().Int64()
-	st.AverageDelayInMilliseconds = time.Duration(i).Milliseconds()
+func (blitz *Blitz) Status() (st Status) {
+	// compute available slots for each queue
+	st.Slots = make([]int64, len(blitz.limiters))
+	for i, l := range blitz.limiters {
+		st.Slots[i] = int64(math.Floor(l.Tokens()))
+	}
+
+	// compute the average delay for each queue
+	st.Delays = make([]int64, len(blitz.limiters))
+	for i, s := range blitz.stats {
+		a, _ := s.Average().Int64()
+		st.Delays[i] = time.Duration(a).Milliseconds()
+	}
+
 	return
 }
 
-type rs struct {
-	Success             bool
-	DelayInMilliseconds int64
-
-	XBlitzReservation string `json:"X-Blitz-Reservation"`
-
-	TokenValidFromUnixMilliseconds  int64
-	TokenValidUntilUnixMilliseconds int64
-}
-
-func (wrap *Blitz) makeReservation() (rs rs) {
-
-	reserve := wrap.limiter.Reserve()
-	if !reserve.OK() {
-		rs.Success = false
-		return
-	}
-
-	now := time.Now()
-
-	delay := reserve.DelayFrom(now)
-	from := now.Add(delay)
-	to := from.Add(wrap.every)
-
-	rs.DelayInMilliseconds = delay.Milliseconds()
-	rs.TokenValidFromUnixMilliseconds = from.UnixMilli()
-	rs.TokenValidUntilUnixMilliseconds = to.UnixMilli()
-
-	// create a message [from, until]
-	message := make([]byte, messageLength)
-	binary.LittleEndian.PutUint64(message[:8], uint64(rs.TokenValidFromUnixMilliseconds))
-	binary.LittleEndian.PutUint64(message[8:], uint64(rs.TokenValidUntilUnixMilliseconds))
-
-	// sign the message with the private key
-	signature := make([]byte, 0, signatureLength)
-	signature = sign.Sign(signature, message, wrap.privKey)
-
-	// encode it as base64
-	rs.XBlitzReservation = base64.StdEncoding.EncodeToString(signature)
-	return
-}
-
-var (
-	errInvalidReservationFormat    = errors.New("invalid reservation format")
-	errInvalidReservationSignature = errors.New("invalid reservation signature")
-	errReservationExpired          = errors.New("reservation expired")
+const (
+	HeaderReservation = "X-Blitz-Reservation"
+	HeaderQueue       = "X-Blitz-Queue"
 )
-
-var (
-	messageLength   = 2 * (64 / 8)                                   // length of the reservation, 2 bytes of 64 ints
-	signatureLength = messageLength + sign.Overhead                  // length of message + signature
-	encodedLength   = base64.StdEncoding.EncodedLen(signatureLength) // length of base64
-)
-
-// validReservation ensures that a reservation is valid
-//
-// If a reservation is invalid, returns false.
-// If a request is not yet valid, waits until it is, and then returns true
-func (wrap *Blitz) validReservation(ctx context.Context, token string) error {
-	if len(token) != encodedLength {
-		return errInvalidReservationFormat
-	}
-
-	// do the decode!
-	signed, err := base64.StdEncoding.DecodeString(token)
-	if err != nil {
-		return errInvalidReservationFormat
-	}
-
-	// verify the message
-	message := make([]byte, 16)
-	if _, valid := sign.Open(message, signed, wrap.pubKey); !valid {
-		return errInvalidReservationSignature
-	}
-
-	// get valid (from, until) times
-	validFrom := time.UnixMilli(int64(binary.LittleEndian.Uint64(message[:8])))
-	validUntil := time.UnixMilli(int64(binary.LittleEndian.Uint64(message[8:])))
-
-	now := time.Now()
-	switch {
-	// valid now!
-	case now.After(validFrom) && now.Before(validUntil):
-		return nil
-
-		// not yet valid => wait until it is
-	case now.Before(validFrom):
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Until(validFrom)):
-			return nil
-		}
-
-	// signature expired
-	default:
-		return errReservationExpired
-	}
-}
-
-func (wrap *Blitz) serveBlitz(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(wrap.Status())
-
-	case http.MethodPost:
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(wrap.makeReservation())
-
-	default:
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-	}
-}
 
 func (wrap *Blitz) logF(fmt string, args ...any) {
-	if wrap.logger == nil {
+	if wrap.Logger == nil {
 		log.Printf(fmt, args...)
 		return
 	}
-	wrap.logger.Printf(fmt, args...)
+	wrap.Logger.Printf(fmt, args...)
 }
 
-func (wrap *Blitz) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// getQueueHeader returns the header indicating the current queue.
+// If no such header is present, it is of invalid format, or in-bounds checking fails, returns 0.
+func (blitz *Blitz) getQueueHeader(r *http.Request) int {
+	header := r.Header.Get(HeaderQueue)
+	value, err := strconv.ParseInt(header, 10, 64)
+	if err != nil {
+		return 0
+	}
+	if value < 0 || value >= int64(len(blitz.limiters)) {
+		return 0
+	}
+	return int(value)
+}
+
+func (blitz *Blitz) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/blitz/" {
-		wrap.serveBlitz(w, r)
+		switch r.Method {
+		case http.MethodGet:
+			blitz.serveStatus(w, r)
+		case http.MethodPost:
+			blitz.serveReservation(w, r)
+		default:
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		}
 		return
 	}
 
 	// passing the 'X-Blitz-Reservation' indicates that we reserved in the past.
 	// we trust that the client has delayed accordingly.
-	if reservation := r.Header.Get("X-Blitz-Reservation"); reservation != "" {
-		// validate the request
-		if err := wrap.validReservation(r.Context(), reservation); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(w, "Bad Request: %v\n", err)
-			return
-		}
-
-		// forward the request
-		r.Header.Del("X-Blitz-Request")
-		wrap.Handler.ServeHTTP(w, r)
+	if reservation := r.Header.Get(HeaderReservation); reservation != "" {
+		blitz.serveUseReservation(reservation, w, r)
 		return
 	}
 
-	// create a reservation
-	reserve := wrap.limiter.Reserve()
-	defer reserve.Cancel()
+	blitz.serveRegular(w, r)
+
+}
+
+func (blitz *Blitz) serveStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(blitz.Status())
+}
+
+func (blitz *Blitz) serveReservation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	reservation := blitz.signReservation(blitz.getQueueHeader(r))
+
+	// if the reservation was a success,
+	if reservation.Success {
+		delay := time.Duration(reservation.DelayInMilliseconds * int64(time.Millisecond))
+		blitz.logF("client %q on queue %d delay %s", r.RemoteAddr, reservation.Queue, delay)
+		blitz.stats[reservation.Queue].AddInt64(delay.Nanoseconds())
+	}
+
+	json.NewEncoder(w).Encode(reservation)
+}
+
+func (blitz *Blitz) serveUseReservation(reservation string, w http.ResponseWriter, r *http.Request) {
+	// validate the request
+	if err := blitz.useReservation(r.Context(), reservation); err != nil {
+		blitz.logF("client %q bad reservation: %v", r.RemoteAddr, err)
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Bad Request: %v\n", err)
+
+		return
+	}
+
+	// delete the special headers
+	r.Header.Del(HeaderReservation)
+	r.Header.Del(HeaderQueue)
+
+	// and forward the request
+	blitz.Handler.ServeHTTP(w, r)
+}
+
+func (blitz *Blitz) serveRegular(w http.ResponseWriter, r *http.Request) {
+	reservation, index := blitz.reserve(blitz.getQueueHeader(r))
+	if index == -1 {
+		blitz.logF("client %q delay ∞", r.RemoteAddr)
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, "∞ delay")
+
+		return
+	}
 
 	// check that we have a finite delay to wait
-	delay := reserve.Delay()
+	delay := reservation.Delay()
 	if delay == rate.InfDuration {
-		wrap.logF("client %q delay ∞", r.RemoteAddr)
+		blitz.logF("client %q delay ∞", r.RemoteAddr)
 
 		w.WriteHeader(http.StatusBadGateway)
 		io.WriteString(w, "∞ delay")
 		return
 	}
-	wrap.logF("client %q delay %s", r.RemoteAddr, delay)
-	wrap.stats.AddInt64(delay.Nanoseconds())
 
-	// wait
+	// log the delay
+	blitz.logF("client %q on queue %d delay %s", r.RemoteAddr, index, delay)
+	blitz.stats[index].AddInt64(delay.Nanoseconds())
+
+	// wait for the delay or the request to expire
+	// whichever happens first
 	select {
 	case <-r.Context().Done():
 		w.WriteHeader(http.StatusBadGateway)
-		io.WriteString(w, "Infinite Delay (wrong config?)")
-
-		return
+		io.WriteString(w, "Request cancelled by client")
 	case <-time.After(delay):
-		/* see below */
-	}
+		// delete the special headers
+		r.Header.Del(HeaderReservation)
+		r.Header.Del(HeaderQueue)
 
-	// call the handler
-	wrap.Handler.ServeHTTP(w, r)
+		// and forward
+		blitz.Handler.ServeHTTP(w, r)
+	}
 }
