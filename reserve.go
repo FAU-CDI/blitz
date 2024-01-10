@@ -2,12 +2,9 @@ package blitz
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/binary"
-	"errors"
+	"fmt"
 	"time"
 
-	"golang.org/x/crypto/nacl/sign"
 	"golang.org/x/time/rate"
 )
 
@@ -72,12 +69,6 @@ type reservation struct {
 	TokenValidUntilUnixMilliseconds int64
 }
 
-var (
-	errInvalidReservationFormat    = errors.New("invalid reservation format")
-	errInvalidReservationSignature = errors.New("invalid reservation signature")
-	errReservationExpired          = errors.New("reservation expired")
-)
-
 // signReservation creates and signs a reservation object for the given queue.
 func (wrap *Blitz) signReservation(queue int) (rs reservation) {
 	reserve, index := wrap.reserve(queue)
@@ -88,7 +79,7 @@ func (wrap *Blitz) signReservation(queue int) (rs reservation) {
 	rs.Queue = index
 	rs.Success = true
 
-	now := time.Now()
+	now := time.Now().UTC()
 
 	delay := reserve.DelayFrom(now)
 	from := now.Add(delay)
@@ -98,53 +89,34 @@ func (wrap *Blitz) signReservation(queue int) (rs reservation) {
 	rs.TokenValidFromUnixMilliseconds = from.UnixMilli()
 	rs.TokenValidUntilUnixMilliseconds = to.UnixMilli()
 
-	// create a message [from, until, queue]
-	message := make([]byte, messageLength)
-	binary.LittleEndian.PutUint64(message[0:8], uint64(rs.TokenValidFromUnixMilliseconds))
-	binary.LittleEndian.PutUint64(message[8:16], uint64(rs.TokenValidUntilUnixMilliseconds))
-
-	// sign the message with the private key
-	signature := make([]byte, 0, signatureLength)
-	signature = sign.Sign(signature, message, wrap.privKey)
-
-	// encode it as base64
-	rs.XBlitzReservation = base64.StdEncoding.EncodeToString(signature)
+	// encode the reservation token
+	rs.XBlitzReservation = wrap.signer.Encode(from, to)
 
 	return
 }
 
-var (
-	messageLength   = 2 * (64 / 8)                                   // length of the reservation, 3 bytes of 64 ints
-	signatureLength = messageLength + sign.Overhead                  // length of message + signature
-	encodedLength   = base64.StdEncoding.EncodedLen(signatureLength) // length of base64
-)
+type errReservationExpired struct {
+	ValidUntil, CurrentTime time.Time
+}
+
+func (err errReservationExpired) Error() string {
+	return fmt.Sprintf("reservation expired: valid through %d, but it is now %d", err.ValidUntil.UnixMilli(), err.CurrentTime.UnixMilli())
+}
 
 // useReservation uses the given reservation.
 //
 // If a reservation is invalid, returns false.
 // If a request is not yet valid, waits until it is, and then returns true.
 func (wrap *Blitz) useReservation(ctx context.Context, token string) error {
-	if len(token) != encodedLength {
-		return errInvalidReservationFormat
-	}
 
-	// do the decode!
-	signed, err := base64.StdEncoding.DecodeString(token)
+	// decode the message
+	validFrom, validUntil, err := wrap.signer.Decode(token)
 	if err != nil {
-		return errInvalidReservationFormat
+		return err
 	}
 
-	// verify the message
-	message := make([]byte, messageLength)
-	if _, valid := sign.Open(message, signed, wrap.pubKey); !valid {
-		return errInvalidReservationSignature
-	}
-
-	// get valid (from, until) times
-	validFrom := time.UnixMilli(int64(binary.LittleEndian.Uint64(message[0:8])))
-	validUntil := time.UnixMilli(int64(binary.LittleEndian.Uint64(message[8:16])))
-
-	now := time.Now()
+	// check validity
+	now := time.Now().UTC()
 	switch {
 	// valid now!
 	case now.After(validFrom) && now.Before(validUntil):
@@ -161,6 +133,6 @@ func (wrap *Blitz) useReservation(ctx context.Context, token string) error {
 
 	// signature expired
 	default:
-		return errReservationExpired
+		return errReservationExpired{ValidUntil: validUntil, CurrentTime: now}
 	}
 }

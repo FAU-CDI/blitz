@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"time"
 
-	"golang.org/x/crypto/nacl/sign"
 	"golang.org/x/time/rate"
 )
 
@@ -35,13 +34,11 @@ func New(rand io.Reader, handler http.Handler, every time.Duration, bs []uint64)
 		blitz.stats[i] = NewStats(10 * every)
 	}
 
-	puk, pik, err := sign.GenerateKey(rand)
+	signer, err := newSigner(rand)
 	if err != nil {
 		return nil, err
 	}
-
-	blitz.pubKey = puk
-	blitz.privKey = pik
+	blitz.signer = signer
 
 	return blitz, nil
 }
@@ -53,8 +50,7 @@ type Blitz struct {
 	limiters []*rate.Limiter
 	stats    []*Stats
 
-	pubKey  *[32]byte
-	privKey *[64]byte
+	signer signer
 
 	Logger  *log.Logger
 	Handler http.Handler
